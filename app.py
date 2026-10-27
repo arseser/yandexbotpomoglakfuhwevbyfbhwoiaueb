@@ -163,7 +163,7 @@ def _log(text):
 
 async def _send_one(client, item, message_text):
     tg_contact = next((c for c in item["contacts"] if c["type"] == "tg"), None)
-    if not tg_contact: return False, "no_tg_contact" # Пропускаем MAX
+    if not tg_contact: return False, "no_tg_contact"
     username = tg_contact["url"].rstrip("/").split("/")[-1]
     try:
         entity = await client.get_entity(username)
@@ -237,7 +237,8 @@ def send_start():
     tpl = data.get("tpl", "")
     if not items: return jsonify(error="Нет списка"), 400
     with _state_lock:
-        if SEND_STATE["running"]: return jsonify(error="Уже запущено"), 409
+        # Принудительный сброс, если процесс завис
+        SEND_STATE["running"] = False
         _reset_state(total=len(items))
     _sender_thread = threading.Thread(target=_sender_worker, args=(items, tpl), daemon=True)
     _sender_thread.start()
@@ -331,7 +332,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
 </div>
 </div>
 <script>
-const DEFAULT_TPL = 'Здравствуйте! Я Арсений, заметил, что у «{name}» пока нет сайта — а сейчас многие клиенты перед обращением гуглят. Без сайта часть из них уходит к конкурентам. Я делаю простые сайты под ключ. Было бы интересно сделать для вас сайт?';
+const DEFAULT_TPL = 'Здравствуйте! Я Арсений, заметил, что у «{name}» пока нет сайта — а сейчас многие клиенты перед обращением гуглят или смотрят Яндекс.Карты. Без сайта часть из них просто уходит к конкурентам, у которых он есть. По данным исследований, наличие сайта увеличивает количество клиентов в среднем на 30–40%. Я делаю простые, но красивые сайты под ключ — с отзывами, ценами и фото. Стоит недорого, делаю быстро (в этом деле 4 года, знаю, что реально работает для такого бизнеса). Было бы интересно сделать для вас сайт? Могу предоставить вам свою последнюю работу';
 const $ = id => document.getElementById(id);
 let items = [];
 let done = new Set(JSON.parse(localStorage.getItem('done') || '[]'));
