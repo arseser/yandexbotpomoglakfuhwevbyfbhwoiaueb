@@ -14,3 +14,5 @@ services:
         sync: false
       - key: SEND_DELAY
         value: "60"
+      - key: SETUP_TOKEN
+        sync: false
