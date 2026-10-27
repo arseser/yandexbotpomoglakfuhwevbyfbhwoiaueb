@@ -2,11 +2,13 @@
 """
 Рассылочный помощник + фоновый сендер в Telegram (Telethon).
 Ключи читаются только из переменных окружения (Render → Environment).
+Логин в Telegram делается через /setup?token=... (VPN не нужен).
 """
 import csv
 import io
 import os
 import re
+import secrets
 import socket
 import threading
 import time
@@ -16,7 +18,6 @@ from urllib.parse import urlparse
 
 from flask import Flask, jsonify, render_template_string, request
 
-# ---------- Telethon ----------
 try:
     from telethon import TelegramClient, errors
     from telethon.sessions import StringSession
@@ -30,10 +31,16 @@ app = Flask(__name__)
 # ====================== НАСТРОЙКИ ИЗ ОКРУЖЕНИЯ ======================
 TG_API_ID = os.environ.get("TG_API_ID")
 TG_API_HASH = os.environ.get("TG_API_HASH")
-TG_SESSION_STRING = os.environ.get("TG_SESSION_STRING")
-SEND_DELAY = int(os.environ.get("SEND_DELAY", "60"))  # секунд между сообщениями
+SEND_DELAY = int(os.environ.get("SEND_DELAY", "60"))
 
-# ====================== ФИЛЬТРЫ (как было) ======================
+# Токен для доступа к /setup. Если не задан — генерируется и печатается в логи.
+SETUP_TOKEN = os.environ.get("SETUP_TOKEN") or secrets.token_urlsafe(18)
+print(f"[setup] SETUP_TOKEN = {SETUP_TOKEN}", flush=True)
+
+# Строка сессии: сначала из env, потом из памяти (после /setup без рестарта)
+_runtime_session_string = os.environ.get("TG_SESSION_STRING", "") or ""
+
+# ====================== ФИЛЬТРЫ ======================
 NOT_A_SITE = {
     "vk.com", "vk.ru", "m.vk.com", "instagram.com", "facebook.com", "fb.com", "ok.ru",
     "t.me", "telegram.me", "telegram.dog", "wa.me", "whatsapp.com", "api.whatsapp.com",
@@ -191,20 +198,13 @@ def process(filename: str, data: bytes):
     return {"items": items, "stats": stats}
 
 
-# ====================== ФОНОВАЯ ОТПРАВКА В TELEGRAM ======================
+# ====================== СОСТОЯНИЕ СЕНДЕРА ======================
 SEND_STATE = {
-    "running": False,
-    "paused": False,
-    "stop_requested": False,
-    "current_index": -1,
-    "total": 0,
-    "sent": 0,
-    "failed": 0,
-    "skipped": 0,
-    "log": [],
-    "sent_ids": set(),   # id или name отправленных
+    "running": False, "paused": False, "stop_requested": False,
+    "current_index": -1, "total": 0,
+    "sent": 0, "failed": 0, "skipped": 0,
+    "log": [], "sent_ids": set(),
 }
-
 _sender_thread = None
 _state_lock = threading.Lock()
 
@@ -212,16 +212,10 @@ _state_lock = threading.Lock()
 def _reset_state(total=0):
     with _state_lock:
         SEND_STATE.update({
-            "running": True,
-            "paused": False,
-            "stop_requested": False,
-            "current_index": -1,
-            "total": total,
-            "sent": 0,
-            "failed": 0,
-            "skipped": 0,
-            "log": [],
-            "sent_ids": set(),
+            "running": True, "paused": False, "stop_requested": False,
+            "current_index": -1, "total": total,
+            "sent": 0, "failed": 0, "skipped": 0,
+            "log": [], "sent_ids": set(),
         })
 
 
@@ -239,25 +233,27 @@ def _wait_if_paused():
         time.sleep(0.5)
 
 
+def _log(text):
+    with _state_lock:
+        SEND_STATE["log"].append(text)
+        if len(SEND_STATE["log"]) > 200:
+            SEND_STATE["log"] = SEND_STATE["log"][-200:]
+
+
 async def _send_one(client, item, message_text):
-    """Отправляет сообщение одному бизнесу. Возвращает (ok, reason)."""
     tg_contact = next((c for c in item["contacts"] if c["type"] == "tg"), None)
     if not tg_contact:
         return False, "no_tg_contact"
-
-    url = tg_contact["url"]  # https://t.me/username
-    username = url.rstrip("/").split("/")[-1]
-
+    username = tg_contact["url"].rstrip("/").split("/")[-1]
     try:
         entity = await client.get_entity(username)
     except Exception as e:
         return False, f"entity_error: {type(e).__name__}"
 
-    # --- ПРОВЕРКА: только реальный пользователь ---
     if not isinstance(entity, User):
-        return False, "not_a_user"          # канал, группа, чат
-    if entity.bot:
-        return False, "is_bot"              # бот
+        return False, "not_a_user"
+    if getattr(entity, "bot", False):
+        return False, "is_bot"
     if getattr(entity, "deleted", False):
         return False, "deleted_account"
 
@@ -273,7 +269,6 @@ async def _send_one(client, item, message_text):
 
 
 def _sender_worker(items, tpl, add_yandex):
-    """Фоновый поток: собственный event loop для Telethon."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -281,24 +276,25 @@ def _sender_worker(items, tpl, add_yandex):
         if not TELETHON_OK:
             _log("Telethon не установлен")
             return
-        if not all([TG_API_ID, TG_API_HASH, TG_SESSION_STRING]):
-            _log("Не заданы TG_API_ID / TG_API_HASH / TG_SESSION_STRING")
+        if not TG_API_ID or not TG_API_HASH:
+            _log("Не заданы TG_API_ID / TG_API_HASH")
+            return
+        session_str = (os.environ.get("TG_SESSION_STRING") or _runtime_session_string or "").strip()
+        if not session_str:
+            _log("Нет сессии. Зайди в /setup и авторизуйся.")
             return
 
-        session = StringSession(TG_SESSION_STRING.strip())
-        client = TelegramClient(session, int(TG_API_ID), TG_API_HASH)
-
+        client = TelegramClient(StringSession(session_str), int(TG_API_ID), TG_API_HASH)
         try:
             await client.connect()
             if not await client.is_user_authorized():
-                _log("Сессия не авторизована. Сгенерируй SESSION_STRING заново.")
+                _log("Сессия не авторизована. Пройди /setup заново.")
                 return
 
             for idx, item in enumerate(items):
                 if _should_stop():
                     _log("Остановлено пользователем")
                     break
-
                 _wait_if_paused()
                 if _should_stop():
                     break
@@ -311,7 +307,6 @@ def _sender_worker(items, tpl, add_yandex):
                     msg += "\n\nЯндекс.Карты: " + item["yandex"]
 
                 ok, reason = await _send_one(client, item, msg)
-
                 with _state_lock:
                     key = item["id"] or item["name"]
                     if ok:
@@ -319,20 +314,18 @@ def _sender_worker(items, tpl, add_yandex):
                         SEND_STATE["sent_ids"].add(key)
                         _log(f"✅ {item['name']} — отправлено")
                     else:
-                        if reason in ("no_tg_contact",):
+                        if reason == "no_tg_contact":
                             SEND_STATE["skipped"] += 1
                         else:
                             SEND_STATE["failed"] += 1
                         _log(f"⏭ {item['name']} — {reason}")
 
-                # Задержка между сообщениями (с учётом паузы)
                 if idx < len(items) - 1:
                     waited = 0
                     while waited < SEND_DELAY and not _should_stop():
                         _wait_if_paused()
                         time.sleep(0.5)
                         waited += 0.5
-
         finally:
             await client.disconnect()
 
@@ -347,38 +340,26 @@ def _sender_worker(items, tpl, add_yandex):
             SEND_STATE["paused"] = False
 
 
-def _log(text):
-    with _state_lock:
-        SEND_STATE["log"].append(text)
-        if len(SEND_STATE["log"]) > 200:
-            SEND_STATE["log"] = SEND_STATE["log"][-200:]
-
-
+# ====================== API СЕНДЕРА ======================
 @app.post("/send_start")
 def send_start():
     global _sender_thread
     if not TELETHON_OK:
         return jsonify(error="Telethon не установлен на сервере"), 400
-
     data = request.get_json(silent=True) or {}
     items = data.get("items")
     tpl = data.get("tpl", "")
-    add_yandex = bool(data.get("add_yandex", False))
     if not items:
         return jsonify(error="Нет списка для отправки"), 400
     if not tpl.strip():
         return jsonify(error="Пустой шаблон сообщения"), 400
-
     with _state_lock:
         if SEND_STATE["running"]:
             return jsonify(error="Рассылка уже запущена"), 409
         _reset_state(total=len(items))
-
-    _sender_thread = threading.Thread(
-        target=_sender_worker,
-        args=(items, tpl, add_yandex),
-        daemon=True,
-    )
+    _sender_thread = threading.Thread(target=_sender_worker,
+                                      args=(items, tpl, bool(data.get("add_yandex"))),
+                                      daemon=True)
     _sender_thread.start()
     return jsonify(ok=True, message="Рассылка запущена")
 
@@ -406,26 +387,136 @@ def send_stop():
     with _state_lock:
         SEND_STATE["stop_requested"] = True
         SEND_STATE["paused"] = False
-    return jsonify(ok=True, message="Запрошена остановка")
+    return jsonify(ok=True)
 
 
 @app.get("/send_status")
 def send_status():
     with _state_lock:
         return jsonify({
-            "running": SEND_STATE["running"],
-            "paused": SEND_STATE["paused"],
-            "current_index": SEND_STATE["current_index"],
-            "total": SEND_STATE["total"],
-            "sent": SEND_STATE["sent"],
-            "failed": SEND_STATE["failed"],
+            "running": SEND_STATE["running"], "paused": SEND_STATE["paused"],
+            "current_index": SEND_STATE["current_index"], "total": SEND_STATE["total"],
+            "sent": SEND_STATE["sent"], "failed": SEND_STATE["failed"],
             "skipped": SEND_STATE["skipped"],
             "sent_ids": list(SEND_STATE["sent_ids"]),
             "log": SEND_STATE["log"][-30:],
         })
 
 
-# ====================== СТАРЫЕ ЭНДПОИНТЫ ======================
+# ====================== SETUP (логин в TG через браузер) ======================
+_login_clients = {}  # token -> {"loop", "client", "phone", "hash"}
+
+
+def _check_setup(token):
+    return bool(SETUP_TOKEN) and token == SETUP_TOKEN
+
+
+@app.get("/setup")
+def setup_page():
+    token = request.args.get("token", "")
+    if not _check_setup(token):
+        return "Not found", 404
+    return render_template_string(SETUP_PAGE, token=token)
+
+
+@app.post("/setup/send_code")
+def setup_send_code():
+    data = request.get_json(silent=True) or {}
+    if not _check_setup(data.get("token", "")):
+        return jsonify(error="forbidden"), 403
+    if not TELETHON_OK:
+        return jsonify(error="Telethon не установлен"), 400
+    if not TG_API_ID or not TG_API_HASH:
+        return jsonify(error="TG_API_ID / TG_API_HASH не заданы на Render"), 400
+    phone = (data.get("phone") or "").strip()
+    if not phone:
+        return jsonify(error="Укажи телефон, например +79001234567"), 400
+    token = data["token"]
+
+    # закрываем предыдущий клиент, если был
+    old = _login_clients.pop(token, None)
+    if old:
+        try:
+            old["loop"].run_until_complete(old["client"].disconnect())
+        except Exception:
+            pass
+        try:
+            old["loop"].close()
+        except Exception:
+            pass
+
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        client = TelegramClient(StringSession(), int(TG_API_ID), TG_API_HASH, loop=loop)
+        loop.run_until_complete(client.connect())
+        sent = loop.run_until_complete(
+            client.send_code_request(phone, force_sms=bool(data.get("force_sms")))
+        )
+        _login_clients[token] = {
+            "loop": loop, "client": client,
+            "phone": phone, "hash": sent.phone_code_hash,
+        }
+        return jsonify(ok=True, message="Код отправлен")
+    except Exception as e:
+        return jsonify(error=f"{type(e).__name__}: {e}"), 400
+
+
+@app.post("/setup/verify")
+def setup_verify():
+    global _runtime_session_string
+    data = request.get_json(silent=True) or {}
+    token = data.get("token", "")
+    if not _check_setup(token):
+        return jsonify(error="forbidden"), 403
+    state = _login_clients.get(token)
+    if not state:
+        return jsonify(error="Сначала запроси код"), 400
+
+    code = (data.get("code") or "").strip()
+    password = (data.get("password") or "").strip()
+    loop, client = state["loop"], state["client"]
+
+    try:
+        if password:
+            loop.run_until_complete(client.sign_in(password=password))
+        else:
+            if not code:
+                return jsonify(error="Укажи код"), 400
+            try:
+                loop.run_until_complete(client.sign_in(
+                    phone=state["phone"], code=code, phone_code_hash=state["hash"]
+                ))
+            except errors.SessionPasswordNeededError:
+                return jsonify(needs_password=True,
+                               message="Включена 2FA — введи облачный пароль")
+    except errors.PhoneCodeInvalidError:
+        return jsonify(error="Неверный код"), 400
+    except errors.PhoneCodeExpiredError:
+        return jsonify(error="Код истёк — запроси заново"), 400
+    except errors.PasswordHashInvalidError:
+        return jsonify(error="Неверный пароль 2FA"), 400
+    except Exception as e:
+        return jsonify(error=f"{type(e).__name__}: {e}"), 400
+
+    if not loop.run_until_complete(client.is_user_authorized()):
+        return jsonify(error="Не удалось авторизоваться"), 400
+
+    session_str = client.session.save()
+    _runtime_session_string = session_str
+    try:
+        loop.run_until_complete(client.disconnect())
+    except Exception:
+        pass
+    try:
+        loop.close()
+    except Exception:
+        pass
+    _login_clients.pop(token, None)
+    return jsonify(ok=True, session=session_str)
+
+
+# ====================== ГЛАВНАЯ ======================
 @app.post("/upload")
 def upload():
     f = request.files.get("file")
@@ -442,7 +533,86 @@ def index():
     return render_template_string(PAGE)
 
 
-# ====================== HTML (обновлённый) ======================
+# ====================== HTML: SETUP ======================
+SETUP_PAGE = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Вход в Telegram</title>
+<style>
+body{font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif;padding:20px;max-width:620px;margin:0 auto;background:#f6f7f9;color:#1b1f24}
+h1{font-size:20px}
+label{display:block;margin-top:14px;font-weight:600;font-size:14px}
+input,button{font:inherit;width:100%;box-sizing:border-box;padding:10px;border-radius:8px;border:1px solid #ccc;margin-top:4px}
+button{cursor:pointer;background:#2f6fed;color:#fff;border:0}
+button:hover{filter:brightness(.95)}
+.box{background:#fff;padding:12px;border-radius:8px;margin:12px 0;word-break:break-all;font-family:ui-monospace,monospace;font-size:12px;border:1px solid #e2e5ea}
+#log{margin-top:14px;font-size:14px}
+#result{display:none;margin-top:20px}
+.hint{color:#6b7480;font-size:13px}
+</style></head><body>
+<h1>Первичный вход в Telegram</h1>
+<p class="hint">Введи телефон в формате <code>+79001234567</code>. Код придёт в Telegram (или по SMS, если отметить галочку). Если включена 2FA — попросит пароль. VPN не нужен: авторизация идёт с серверов Render.</p>
+
+<label>Телефон</label>
+<input id="phone" type="tel" placeholder="+79001234567">
+<label style="margin-top:10px;font-weight:400;font-size:13px">
+  <input type="checkbox" id="smsgate" style="width:auto;margin-right:6px"> Отправить код по SMS
+</label>
+<button onclick="sendCode()">Отправить код</button>
+
+<div id="step2" style="display:none">
+  <label>Код из Telegram/SMS</label>
+  <input id="code" type="text" placeholder="12345">
+  <button onclick="verify(false)">Проверить код</button>
+</div>
+
+<div id="step3" style="display:none">
+  <label>Облачный пароль (2FA)</label>
+  <input id="pwd" type="password">
+  <button onclick="verify(true)">Войти</button>
+</div>
+
+<div id="log"></div>
+
+<div id="result">
+  <h2>Готово ✅</h2>
+  <p>Скопируй строку ниже → вставь её в Render → <b>Environment</b> → <code>TG_SESSION_STRING</code> → Manual Deploy.</p>
+  <div class="box" id="sess"></div>
+</div>
+
+<script>
+const TOKEN = new URLSearchParams(location.search).get('token');
+const $ = id => document.getElementById(id);
+function log(msg, err){ $('log').innerHTML = `<span style="color:${err?'#c00':'#1f9d55'}">${msg}</span>`; }
+async function api(path, body){
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({token: TOKEN, ...body})});
+  return r.json();
+}
+async function sendCode(){
+  log('Отправляю...');
+  const j = await api('/setup/send_code', {phone: $('phone').value.trim(), force_sms: $('smsgate').checked});
+  if (j.error){ log(j.error, true); return; }
+  log('Код отправлен. Проверь Telegram или SMS.');
+  $('step2').style.display = 'block';
+}
+async function verify(usePwd){
+  log('Проверяю...');
+  const body = usePwd ? {password: $('pwd').value} : {code: $('code').value.trim()};
+  const j = await api('/setup/verify', body);
+  if (j.needs_password){ $('step3').style.display = 'block'; log('Введи пароль 2FA'); return; }
+  if (j.error){ log(j.error, true); return; }
+  if (j.ok){
+    log('Авторизован!');
+    $('step2').style.display = 'none';
+    $('step3').style.display = 'none';
+    $('result').style.display = 'block';
+    $('sess').textContent = j.session;
+  }
+}
+</script></body></html>"""
+
+
+# ====================== HTML: ГЛАВНАЯ ======================
 PAGE = r"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -600,7 +770,6 @@ function upload(file){
   }).catch(e => $('err').textContent = 'Ошибка: ' + e);
 }
 
-// ---------- UI сендера ----------
 function setSendUI(st){
   const running = st.running, paused = st.paused;
   $('btnStart').disabled = running;
@@ -620,23 +789,15 @@ function setSendUI(st){
     render();
   }
 }
-
-function pollSend(){
-  fetch('/send_status').then(r => r.json()).then(setSendUI).catch(()=>{});
-}
+function pollSend(){ fetch('/send_status').then(r => r.json()).then(setSendUI).catch(()=>{}); }
 setInterval(pollSend, 2000);
 pollSend();
 
 $('btnStart').onclick = () => {
   if (!items.length){ alert('Сначала загрузи файл'); return; }
-  fetch('/send_start', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
+  fetch('/send_start', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({items, tpl: $('tpl').value, add_yandex: $('addYa').checked})
-  }).then(r => r.json()).then(j => {
-    if (j.error) alert(j.error);
-    pollSend();
-  });
+  }).then(r => r.json()).then(j => { if (j.error) alert(j.error); pollSend(); });
 };
 $('btnPause').onclick = () => fetch('/send_pause', {method:'POST'}).then(pollSend);
 $('btnResume').onclick = () => fetch('/send_resume', {method:'POST'}).then(pollSend);
