@@ -90,7 +90,7 @@ def read_rows(filename: str, data: bytes):
     if name.endswith((".xlsx", ".xlsm")):
         from openpyxl import load_workbook
         wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-        ws = wb.active # <--- ИСПРАВЛЕН БАГ: вернул переменную ws
+        ws = wb.active
         rows = [["" if v is None else str(v) for v in r] for r in ws.iter_rows(values_only=True)]
     else:
         text = data.decode("utf-8-sig", errors="ignore")
@@ -168,7 +168,7 @@ async def _send_one(client, item, message_text):
     try:
         entity = await client.get_entity(username)
     except Exception as e:
-        return False, f"entity_error: {type(e).__name__}"
+        return False, f"entity_error"
     if not isinstance(entity, User): return False, "not_a_user"
     if getattr(entity, "bot", False): return False, "is_bot"
 
@@ -180,9 +180,9 @@ async def _send_one(client, item, message_text):
     except errors.UserPrivacyRestrictedError:
         return False, "privacy_restricted"
     except Exception as e:
-        return False, f"send_error: {type(e).__name__}"
+        return False, f"send_error"
 
-def _sender_worker(items, tpl, skip_done_keys):
+def _sender_worker(items, tpl, done_keys):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -204,10 +204,12 @@ def _sender_worker(items, tpl, skip_done_keys):
                 with _state_lock: SEND_STATE["current_index"] = idx
                 key = item["id"] or item["name"]
 
-                # Пропускаем, если вы уже поставили галочку вручную (без задержки)
-                if key in skip_done_keys:
-                    with _state_lock: SEND_STATE["skipped"] += 1
-                    _log(f"⏭ {item['name']} — уже отмечен вами, пропуск")
+                # Если вы поставили галочку вручную — пропускаем БЕЗ задержки
+                if key in done_keys:
+                    with _state_lock: 
+                        SEND_STATE["skipped"] += 1
+                        SEND_STATE["sent_ids"].add(key) # Чтобы оно зачеркнулось на сайте
+                    _log(f"⏭ {item['name']} — уже отмечено вами")
                     continue
 
                 msg = tpl.replace("{name}", item["name"]).replace("{yandex}", item["yandex"] or "")
@@ -220,19 +222,13 @@ def _sender_worker(items, tpl, skip_done_keys):
                         SEND_STATE["sent"] += 1
                         SEND_STATE["sent_ids"].add(key)
                         _log(f"✅ {item['name']} — отправлено")
-                        should_wait = True # Ждем задержку ТОЛЬКО если сообщение ушло
+                        should_wait = True # Ждем ТОЛЬКО после успешной отправки
                     else:
-                        if reason == "no_tg_contact":
-                            SEND_STATE["skipped"] += 1
-                            _log(f"⏭ {item['name']} — только MAX (пропуск)")
-                        elif reason in ("not_a_user", "is_bot", "entity_error", "privacy_restricted"):
-                            SEND_STATE["skipped"] += 1
-                            _log(f"⏭ {item['name']} — {reason} (пропуск)")
-                        else:
-                            SEND_STATE["failed"] += 1
-                            _log(f"❌ {item['name']} — {reason}")
-                            should_wait = True # Ждем, если это ошибка Telegram (flood_wait)
+                        SEND_STATE["skipped"] += 1 # Если ошибка (бот, канал, макс) — просто зачеркиваем
+                        SEND_STATE["sent_ids"].add(key)
+                        _log(f"⏭ {item['name']} — {reason} (пропуск)")
 
+                # Ждем 60 секунд ТОЛЬКО если сообщение ушло (should_wait = True)
                 if should_wait and idx < len(items) - 1:
                     waited = 0
                     while waited < SEND_DELAY and not _should_stop():
