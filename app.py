@@ -204,35 +204,34 @@ def _sender_worker(items, tpl, done_keys):
                 with _state_lock: SEND_STATE["current_index"] = idx
                 key = item["id"] or item["name"]
 
-                # 1. Пропускаем без задержки, если вы уже поставили галочку
+                # Пропускаем, если пользователь уже поставил галочку
                 if key in done_keys:
                     with _state_lock:
                         SEND_STATE["skipped"] += 1
-                        SEND_STATE["sent_ids"].add(key) # Добавляем, чтобы зачеркнулось на фронте
-                    _log(f"⏭ {item['name']} — уже отмечен вами")
+                        SEND_STATE["sent_ids"].add(key)
+                    _log(f"⏭ {item['name']} — уже отмечено вами")
                     continue
 
                 msg = tpl.replace("{name}", item["name"]).replace("{yandex}", item["yandex"] or "")
                 ok, reason = await _send_one(client, item, msg)
                 
-                should_wait = False # Флаг: нужно ли ждать 60 секунд
+                should_wait = False
 
                 with _state_lock:
                     if ok:
                         SEND_STATE["sent"] += 1
                         SEND_STATE["sent_ids"].add(key)
                         _log(f"✅ {item['name']} — отправлено")
-                        should_wait = True # 2. Ждем ТОЛЬКО если сообщение успешно ушло
+                        should_wait = True # Ждем ТОЛЬКО здесь
                     else:
                         SEND_STATE["skipped"] += 1
-                        SEND_STATE["sent_ids"].add(key) # Зачеркиваем на фронте
-                        if reason == "no_tg_contact": 
+                        SEND_STATE["sent_ids"].add(key)
+                        if reason == "no_tg_contact":
                             _log(f"⏭ {item['name']} — только MAX (пропущено)")
-                        else: 
+                        else:
                             _log(f"⏭ {item['name']} — {reason} (пропущено)")
-                        # 3. Если ошибка (бот, канал и т.д.) — should_wait остается False, идем дальше сразу
 
-                # Ждем 60 секунд ТОЛЬКО если should_wait == True
+                # Задержка только если отправили успешно
                 if should_wait and idx < len(items) - 1:
                     waited = 0
                     while waited < SEND_DELAY and not _should_stop():
@@ -240,11 +239,14 @@ def _sender_worker(items, tpl, done_keys):
         finally:
             await client.disconnect()
 
-    try: loop.run_until_complete(_run())
-    except Exception as e: _log(f"Критическая ошибка: {e}")
+    try: 
+        loop.run_until_complete(_run())
+    except Exception as e: 
+        _log(f"Критическая ошибка: {e}")
     finally:
         loop.close()
-        with _state_lock: SEND_STATE["running"] = False; SEND_STATE["paused"] = False
+        with _state_lock: 
+            SEND_STATE["running"] = False; SEND_STATE["paused"] = False
 
 @app.post("/send_start")
 def send_start():
@@ -258,6 +260,8 @@ def send_start():
     with _state_lock:
         SEND_STATE["running"] = False
         _reset_state(total=len(items))
+    
+    # ИСПРАВЛЕНО: Передаем все 3 аргумента в поток
     _sender_thread = threading.Thread(target=_sender_worker, args=(items, tpl, set(done_keys)), daemon=True)
     _sender_thread.start()
     return jsonify(ok=True)
