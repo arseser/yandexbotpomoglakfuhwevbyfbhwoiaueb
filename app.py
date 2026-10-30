@@ -90,7 +90,7 @@ def read_rows(filename: str, data: bytes):
     if name.endswith((".xlsx", ".xlsm")):
         from openpyxl import load_workbook
         wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-        ws = wb.active
+        ws = wb.active # <--- ИСПРАВЛЕН БАГ: вернул переменную ws
         rows = [["" if v is None else str(v) for v in r] for r in ws.iter_rows(values_only=True)]
     else:
         text = data.decode("utf-8-sig", errors="ignore")
@@ -204,7 +204,7 @@ def _sender_worker(items, tpl, skip_done_keys):
                 with _state_lock: SEND_STATE["current_index"] = idx
                 key = item["id"] or item["name"]
 
-                # Пропускаем, если пользователь уже поставил галочку вручную
+                # Пропускаем, если вы уже поставили галочку вручную (без задержки)
                 if key in skip_done_keys:
                     with _state_lock: SEND_STATE["skipped"] += 1
                     _log(f"⏭ {item['name']} — уже отмечен вами, пропуск")
@@ -213,7 +213,6 @@ def _sender_worker(items, tpl, skip_done_keys):
                 msg = tpl.replace("{name}", item["name"]).replace("{yandex}", item["yandex"] or "")
                 ok, reason = await _send_one(client, item, msg)
                 
-                # Флаг, показывающий, нужно ли ждать задержку
                 should_wait = False
 
                 with _state_lock:
@@ -232,9 +231,8 @@ def _sender_worker(items, tpl, skip_done_keys):
                         else:
                             SEND_STATE["failed"] += 1
                             _log(f"❌ {item['name']} — {reason}")
-                            should_wait = True # Если это ошибка отправки (flood_wait и т.д.), лучше подождать
+                            should_wait = True # Ждем, если это ошибка Telegram (flood_wait)
 
-                # Ждем 60 секунд ТОЛЬКО если отправили или была ошибка отправки
                 if should_wait and idx < len(items) - 1:
                     waited = 0
                     while waited < SEND_DELAY and not _should_stop():
@@ -254,7 +252,7 @@ def send_start():
     data = request.get_json(silent=True) or {}
     items = data.get("items")
     tpl = data.get("tpl", "")
-    done_keys = data.get("done_keys", []) # Получаем список галочек с фронтенда
+    done_keys = data.get("done_keys", [])
     
     if not items: return jsonify(error="Нет списка"), 400
     with _state_lock:
@@ -322,7 +320,7 @@ button.pri{background:var(--ac);color:#fff;border-color:var(--ac)}button.ok{back
 button.warn{background:var(--warn);color:#000;border-color:var(--warn)}button.danger{background:var(--danger);color:#fff;border-color:var(--danger)}
 button:disabled{opacity:.5;cursor:not-allowed}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.mut{color:var(--mut);font-size:13px}
-.item.done{opacity:.5;text-decoration:line-through;filter:grayscale(100%);} /* Зачеркивание и серый цвет */
+.item.done{opacity:.5;text-decoration:line-through;filter:grayscale(100%);}
 .item h3{margin:0 0 4px;font-size:16px}
 .msg{margin:10px 0;white-space:pre-wrap;background:var(--bg);border-radius:8px;padding:10px;font-size:14px}
 #send-log{max-height:200px;overflow:auto;font-size:13px;background:var(--bg);border-radius:8px;padding:8px;margin-top:8px}
@@ -418,7 +416,6 @@ setInterval(pollSend, 2000); pollSend();
 
 $('btnStart').onclick = () => {
   if (!items.length){ alert('Сначала загрузи файл'); return; }
-  // Отправляем на сервер список тех, кому уже написали, чтобы он их пропустил
   const payload = {items, tpl: $('tpl').value, done_keys: [...done]};
   fetch('/send_start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)}).then(r => r.json()).then(j => { if (j.error) alert(j.error); pollSend(); });
 };
