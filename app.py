@@ -168,9 +168,13 @@ async def _send_one(client, item, message_text):
     username = tg_contact["url"].rstrip("/").split("/")[-1]
     try:
         entity = await client.get_entity(username)
+    except (errors.UsernameNotOccupiedError, errors.UsernameInvalidError):
+        return False, "username_not_found"
+    except errors.FloodWaitError as e:
+        return False, f"flood_wait_{e.seconds}s"
     except Exception as e:
-        return False, f"entity_error: {type(e).__name__}"
-    if not isinstance(entity, User): return False, "not_a_user"
+        return False, f"entity_error: {type(e).__name__}: {str(e)[:80]}"
+    if not isinstance(entity, User): return False, f"not_a_user ({type(entity).__name__})"
     if getattr(entity, "bot", False): return False, "is_bot"
 
     try:
@@ -183,7 +187,7 @@ async def _send_one(client, item, message_text):
     except Exception as e:
         return False, f"send_error: {type(e).__name__}"
 
-SKIP_REASONS = {"no_tg_contact", "not_a_user", "is_bot", "privacy_restricted"}
+STRIKE_PREFIXES = ("not_a_user", "is_bot", "username_not_found")
 
 def _sender_worker(items, tpl):
     loop = asyncio.new_event_loop()
@@ -223,11 +227,15 @@ def _sender_worker(items, tpl):
                         SEND_STATE["sent"] += 1
                         SEND_STATE["sent_ids"].add(key)
                         _log(f"✅ {item['name']} — отправлено")
-                    elif reason in SKIP_REASONS or reason.startswith("entity_error"):
-                        # 2) Не человек / канал / бот / не найден / только MAX — зачёркиваем, без кд
+                    elif reason == "no_tg_contact":
+                        # только MAX — не зачёркиваем, просто идём дальше без кд
+                        SEND_STATE["skipped"] += 1
+                        _log(f"⏭ {item['name']} — только MAX (пропущено)")
+                    elif reason.startswith(STRIKE_PREFIXES):
+                        # канал / группа / бот / аккаунт не найден — зачёркиваем, без кд
                         SEND_STATE["skipped"] += 1
                         SEND_STATE["skipped_ids"].add(key)
-                        _log(f"⏭ {item['name']} — {reason} (пропущено)")
+                        _log(f"⏭ {item['name']} — {reason} (зачёркнуто)")
                     else:
                         SEND_STATE["failed"] += 1
                         _log(f"❌ {item['name']} — {reason}")
@@ -407,6 +415,7 @@ $('file').onchange = e => {
   fetch('/upload', {method:'POST', body: fd}).then(r=>r.json()).then(j => {
     if (j.error) { $('err').textContent = j.error; return; }
     items = j.items; $('err').textContent = '';
+    skipped = new Set(); localStorage.removeItem('skipped');
     $('stats').innerHTML = `<span>Всего: <b>${j.stats.total}</b></span> · <span>Подходит: <b>${j.stats.selected}</b></span>`;
     $('result').hidden = false; render();
   }).catch(e => $('err').textContent = 'Ошибка: ' + e);
