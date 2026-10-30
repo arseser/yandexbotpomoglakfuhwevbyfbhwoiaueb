@@ -134,17 +134,18 @@ def process(filename: str, data: bytes):
 SEND_STATE = {
     "running": False, "paused": False, "stop_requested": False,
     "current_index": -1, "total": 0, "sent": 0, "failed": 0, "skipped": 0,
-    "log": [], "sent_ids": set(),
+    "log": [], "sent_ids": set(), "skipped_ids": set(), "manual_done": set(),
 }
 _sender_thread = None
-_state_lock = threading.Lock()
+_state_lock = threading.RLock()
 
-def _reset_state(total=0):
+def _reset_state(total=0, manual_done=()):
     with _state_lock:
         SEND_STATE.update({
             "running": True, "paused": False, "stop_requested": False,
             "current_index": -1, "total": total, "sent": 0, "failed": 0, "skipped": 0,
-            "log": [], "sent_ids": set(),
+            "log": [], "sent_ids": set(), "skipped_ids": set(),
+            "manual_done": set(manual_done),
         })
 
 def _should_stop():
@@ -182,7 +183,9 @@ async def _send_one(client, item, message_text):
     except Exception as e:
         return False, f"send_error: {type(e).__name__}"
 
-def _sender_worker(items, tpl, done_keys):
+SKIP_REASONS = {"no_tg_contact", "not_a_user", "is_bot", "privacy_restricted"}
+
+def _sender_worker(items, tpl):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -201,52 +204,49 @@ def _sender_worker(items, tpl, done_keys):
                 _wait_if_paused()
                 if _should_stop(): break
 
-                with _state_lock: SEND_STATE["current_index"] = idx
                 key = item["id"] or item["name"]
+                with _state_lock:
+                    SEND_STATE["current_index"] = idx
+                    already = key in SEND_STATE["manual_done"]
 
-                # Пропускаем, если пользователь уже поставил галочку
-                if key in done_keys:
-                    with _state_lock:
-                        SEND_STATE["skipped"] += 1
-                        SEND_STATE["sent_ids"].add(key)
-                    _log(f"⏭ {item['name']} — уже отмечено вами")
+                # 1) Ты сам поставил галочку «Написал(а)» — пропускаем сразу, без кд
+                if already:
+                    with _state_lock: SEND_STATE["skipped"] += 1
+                    _log(f"☑ {item['name']} — уже отмечен, пропуск")
                     continue
 
                 msg = tpl.replace("{name}", item["name"]).replace("{yandex}", item["yandex"] or "")
                 ok, reason = await _send_one(client, item, msg)
-                
-                should_wait = False
 
                 with _state_lock:
                     if ok:
                         SEND_STATE["sent"] += 1
                         SEND_STATE["sent_ids"].add(key)
                         _log(f"✅ {item['name']} — отправлено")
-                        should_wait = True # Ждем ТОЛЬКО здесь
-                    else:
+                    elif reason in SKIP_REASONS or reason.startswith("entity_error"):
+                        # 2) Не человек / канал / бот / не найден / только MAX — зачёркиваем, без кд
                         SEND_STATE["skipped"] += 1
-                        SEND_STATE["sent_ids"].add(key)
-                        if reason == "no_tg_contact":
-                            _log(f"⏭ {item['name']} — только MAX (пропущено)")
-                        else:
-                            _log(f"⏭ {item['name']} — {reason} (пропущено)")
+                        SEND_STATE["skipped_ids"].add(key)
+                        _log(f"⏭ {item['name']} — {reason} (пропущено)")
+                    else:
+                        SEND_STATE["failed"] += 1
+                        _log(f"❌ {item['name']} — {reason}")
 
-                # Задержка только если отправили успешно
-                if should_wait and idx < len(items) - 1:
+                # 3) Кулдаун ТОЛЬКО если реально отправили сообщение
+                if ok and idx < len(items) - 1:
                     waited = 0
                     while waited < SEND_DELAY and not _should_stop():
                         _wait_if_paused(); time.sleep(0.5); waited += 0.5
         finally:
             await client.disconnect()
 
-    try: 
-        loop.run_until_complete(_run())
-    except Exception as e: 
-        _log(f"Критическая ошибка: {e}")
+    try: loop.run_until_complete(_run())
+    except Exception as e: _log(f"Критическая ошибка: {e}")
     finally:
         loop.close()
-        with _state_lock: 
-            SEND_STATE["running"] = False; SEND_STATE["paused"] = False
+        with _state_lock:
+            SEND_STATE["running"] = False
+            SEND_STATE["paused"] = False
 
 @app.post("/send_start")
 def send_start():
@@ -254,16 +254,20 @@ def send_start():
     data = request.get_json(silent=True) or {}
     items = data.get("items")
     tpl = data.get("tpl", "")
-    done_keys = data.get("done_keys", [])
-    
     if not items: return jsonify(error="Нет списка"), 400
-    with _state_lock:
-        SEND_STATE["running"] = False
-        _reset_state(total=len(items))
-    
-    # ИСПРАВЛЕНО: Передаем все 3 аргумента в поток
-    _sender_thread = threading.Thread(target=_sender_worker, args=(items, tpl, set(done_keys)), daemon=True)
+    _reset_state(total=len(items), manual_done=data.get("done", []))
+    _sender_thread = threading.Thread(target=_sender_worker, args=(items, tpl), daemon=True)
     _sender_thread.start()
+    return jsonify(ok=True)
+
+@app.post("/mark_done")
+def mark_done():
+    data = request.get_json(silent=True) or {}
+    key = data.get("key")
+    if not key: return jsonify(error="no key"), 400
+    with _state_lock:
+        if data.get("done"): SEND_STATE["manual_done"].add(key)
+        else: SEND_STATE["manual_done"].discard(key)
     return jsonify(ok=True)
 
 @app.post("/send_pause")
@@ -293,7 +297,9 @@ def send_status():
             "running": SEND_STATE["running"], "paused": SEND_STATE["paused"],
             "current_index": SEND_STATE["current_index"], "total": SEND_STATE["total"],
             "sent": SEND_STATE["sent"], "failed": SEND_STATE["failed"], "skipped": SEND_STATE["skipped"],
-            "sent_ids": list(SEND_STATE["sent_ids"]), "log": SEND_STATE["log"][-30:],
+            "sent_ids": list(SEND_STATE["sent_ids"]),
+            "skipped_ids": list(SEND_STATE["skipped_ids"]),
+            "log": SEND_STATE["log"][-30:],
         })
 
 @app.post("/upload")
@@ -324,8 +330,8 @@ button.pri{background:var(--ac);color:#fff;border-color:var(--ac)}button.ok{back
 button.warn{background:var(--warn);color:#000;border-color:var(--warn)}button.danger{background:var(--danger);color:#fff;border-color:var(--danger)}
 button:disabled{opacity:.5;cursor:not-allowed}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.mut{color:var(--mut);font-size:13px}
-.item.done{opacity:.5;text-decoration:line-through;filter:grayscale(100%);}
-.item h3{margin:0 0 4px;font-size:16px}
+.item.done{opacity:.55}.item h3{margin:0 0 4px;font-size:16px}
+.item.skipped{opacity:.55}.item.skipped h3{text-decoration:line-through}
 .msg{margin:10px 0;white-space:pre-wrap;background:var(--bg);border-radius:8px;padding:10px;font-size:14px}
 #send-log{max-height:200px;overflow:auto;font-size:13px;background:var(--bg);border-radius:8px;padding:8px;margin-top:8px}
 .badge{display:inline-block;font-size:12px;padding:1px 7px;border-radius:99px;background:var(--bd);color:var(--mut)}
@@ -359,6 +365,7 @@ const DEFAULT_TPL = 'Здравствуйте! Я Арсений, заметил
 const $ = id => document.getElementById(id);
 let items = [];
 let done = new Set(JSON.parse(localStorage.getItem('done') || '[]'));
+let skipped = new Set(JSON.parse(localStorage.getItem('skipped') || '[]'));
 $('tpl').value = localStorage.getItem('tpl') || DEFAULT_TPL;
 
 function msgFor(it) { return $('tpl').value.replaceAll('{name}', it.name); }
@@ -368,8 +375,9 @@ function render(){
   items.forEach((it, i) => {
     const key = it.id || it.name;
     const isDone = done.has(key);
+    const isSkipped = skipped.has(key);
     if ($('hideDone').checked && isDone) return;
-    const d = document.createElement('div'); d.className = 'card item' + (isDone ? ' done' : '');
+    const d = document.createElement('div'); d.className = 'card item' + (isDone ? ' done' : '') + (isSkipped ? ' skipped' : '');
     d.innerHTML = `<h3>${i+1}. ${it.name}</h3>`;
     const links = document.createElement('div'); links.className = 'row'; links.style.margin = '8px 0';
     it.contacts.forEach(c => { const a = document.createElement('a'); a.href = c.url; a.target = '_blank'; a.textContent = (c.type === 'tg' ? 'Telegram' : 'MAX'); links.append(a); });
@@ -380,7 +388,12 @@ function render(){
     act.append(cp);
     const lb = document.createElement('label'); lb.style.marginLeft = 'auto';
     const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = isDone;
-    cb.onchange = () => { cb.checked ? done.add(key) : done.delete(key); localStorage.setItem('done', JSON.stringify([...done])); render(); };
+    cb.onchange = () => {
+      cb.checked ? done.add(key) : done.delete(key);
+      localStorage.setItem('done', JSON.stringify([...done]));
+      fetch('/mark_done', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key, done: cb.checked})});
+      render();
+    };
     lb.append(cb, ' Написал(а)'); act.append(lb);
     d.append(act); list.append(d);
   });
@@ -394,7 +407,7 @@ $('file').onchange = e => {
   fetch('/upload', {method:'POST', body: fd}).then(r=>r.json()).then(j => {
     if (j.error) { $('err').textContent = j.error; return; }
     items = j.items; $('err').textContent = '';
-    $('stats').innerHTML = `<span>Всего: <b>${j.stats.total}</b></span><span>Подходит: <b>${j.stats.selected}</b></span>`;
+    $('stats').innerHTML = `<span>Всего: <b>${j.stats.total}</b></span> · <span>Подходит: <b>${j.stats.selected}</b></span>`;
     $('result').hidden = false; render();
   }).catch(e => $('err').textContent = 'Ошибка: ' + e);
 };
@@ -411,8 +424,13 @@ function setSendUI(st){
   const badge = $('send-badge'); badge.className = 'badge' + (running ? (paused ? ' pause' : ' run') : ''); badge.textContent = running ? (paused ? 'пауза' : 'работает') : 'не запущено';
   $('send-progress').textContent = running ? `Обработано: ${st.current_index+1} / ${st.total} · отправлено ${st.sent} · ошибок ${st.failed} · пропущено ${st.skipped}` : '';
   $('send-log').innerHTML = (st.log || []).map(x => `<div>${x}</div>`).join('');
-  if (st.sent_ids && st.sent_ids.length){
-    st.sent_ids.forEach(id => done.add(id)); localStorage.setItem('done', JSON.stringify([...done])); render();
+  let changed = false;
+  (st.sent_ids || []).forEach(id => { if (!done.has(id)) { done.add(id); changed = true; } });
+  (st.skipped_ids || []).forEach(id => { if (!skipped.has(id)) { skipped.add(id); changed = true; } });
+  if (changed){
+    localStorage.setItem('done', JSON.stringify([...done]));
+    localStorage.setItem('skipped', JSON.stringify([...skipped]));
+    render();
   }
 }
 function pollSend(){ fetch('/send_status').then(r => r.json()).then(setSendUI).catch(()=>{}); }
@@ -420,8 +438,11 @@ setInterval(pollSend, 2000); pollSend();
 
 $('btnStart').onclick = () => {
   if (!items.length){ alert('Сначала загрузи файл'); return; }
-  const payload = {items, tpl: $('tpl').value, done_keys: [...done]};
-  fetch('/send_start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)}).then(r => r.json()).then(j => { if (j.error) alert(j.error); pollSend(); });
+  const todo = items.filter(it => !done.has(it.id || it.name));
+  if (!todo.length){ alert('Все уже отмечены как написанные'); return; }
+  fetch('/send_start', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({items: todo, tpl: $('tpl').value, done: [...done]})
+  }).then(r => r.json()).then(j => { if (j.error) alert(j.error); pollSend(); });
 };
 $('btnPause').onclick = () => fetch('/send_pause', {method:'POST'}).then(pollSend);
 $('btnResume').onclick = () => fetch('/send_resume', {method:'POST'}).then(pollSend);
