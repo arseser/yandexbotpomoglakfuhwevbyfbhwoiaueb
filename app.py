@@ -168,7 +168,7 @@ async def _send_one(client, item, message_text):
     username = tg_contact["url"].rstrip("/").split("/")[-1]
     try:
         entity = await client.get_entity(username)
-    except (errors.UsernameNotOccupiedError, errors.UsernameInvalidError):
+    except (errors.UsernameNotOccupiedError, errors.UsernameInvalidError, ValueError):
         return False, "username_not_found"
     except errors.FloodWaitError as e:
         return False, f"flood_wait_{e.seconds}s"
@@ -232,10 +232,9 @@ def _sender_worker(items, tpl):
                         SEND_STATE["skipped"] += 1
                         _log(f"⏭ {item['name']} — только MAX (пропущено)")
                     elif reason.startswith(STRIKE_PREFIXES):
-                        # канал / группа / бот / аккаунт не найден — зачёркиваем, без кд
+                        # канал / группа / бот / аккаунт не найден — просто идём дальше, без кд и без зачёркивания
                         SEND_STATE["skipped"] += 1
-                        SEND_STATE["skipped_ids"].add(key)
-                        _log(f"⏭ {item['name']} — {reason} (зачёркнуто)")
+                        _log(f"⏭ {item['name']} — {reason} (пропущено)")
                     else:
                         SEND_STATE["failed"] += 1
                         _log(f"❌ {item['name']} — {reason}")
@@ -339,7 +338,6 @@ button.warn{background:var(--warn);color:#000;border-color:var(--warn)}button.da
 button:disabled{opacity:.5;cursor:not-allowed}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.mut{color:var(--mut);font-size:13px}
 .item.done{opacity:.55}.item h3{margin:0 0 4px;font-size:16px}
-.item.skipped{opacity:.55}.item.skipped h3{text-decoration:line-through}
 .msg{margin:10px 0;white-space:pre-wrap;background:var(--bg);border-radius:8px;padding:10px;font-size:14px}
 #send-log{max-height:200px;overflow:auto;font-size:13px;background:var(--bg);border-radius:8px;padding:8px;margin-top:8px}
 .badge{display:inline-block;font-size:12px;padding:1px 7px;border-radius:99px;background:var(--bd);color:var(--mut)}
@@ -373,7 +371,7 @@ const DEFAULT_TPL = 'Здравствуйте! Я Арсений, заметил
 const $ = id => document.getElementById(id);
 let items = [];
 let done = new Set(JSON.parse(localStorage.getItem('done') || '[]'));
-let skipped = new Set(JSON.parse(localStorage.getItem('skipped') || '[]'));
+localStorage.removeItem('skipped');
 $('tpl').value = localStorage.getItem('tpl') || DEFAULT_TPL;
 
 function msgFor(it) { return $('tpl').value.replaceAll('{name}', it.name); }
@@ -383,9 +381,8 @@ function render(){
   items.forEach((it, i) => {
     const key = it.id || it.name;
     const isDone = done.has(key);
-    const isSkipped = skipped.has(key);
     if ($('hideDone').checked && isDone) return;
-    const d = document.createElement('div'); d.className = 'card item' + (isDone ? ' done' : '') + (isSkipped ? ' skipped' : '');
+    const d = document.createElement('div'); d.className = 'card item' + (isDone ? ' done' : '');
     d.innerHTML = `<h3>${i+1}. ${it.name}</h3>`;
     const links = document.createElement('div'); links.className = 'row'; links.style.margin = '8px 0';
     it.contacts.forEach(c => { const a = document.createElement('a'); a.href = c.url; a.target = '_blank'; a.textContent = (c.type === 'tg' ? 'Telegram' : 'MAX'); links.append(a); });
@@ -415,7 +412,6 @@ $('file').onchange = e => {
   fetch('/upload', {method:'POST', body: fd}).then(r=>r.json()).then(j => {
     if (j.error) { $('err').textContent = j.error; return; }
     items = j.items; $('err').textContent = '';
-    skipped = new Set(); localStorage.removeItem('skipped');
     $('stats').innerHTML = `<span>Всего: <b>${j.stats.total}</b></span> · <span>Подходит: <b>${j.stats.selected}</b></span>`;
     $('result').hidden = false; render();
   }).catch(e => $('err').textContent = 'Ошибка: ' + e);
@@ -435,10 +431,8 @@ function setSendUI(st){
   $('send-log').innerHTML = (st.log || []).map(x => `<div>${x}</div>`).join('');
   let changed = false;
   (st.sent_ids || []).forEach(id => { if (!done.has(id)) { done.add(id); changed = true; } });
-  (st.skipped_ids || []).forEach(id => { if (!skipped.has(id)) { skipped.add(id); changed = true; } });
   if (changed){
     localStorage.setItem('done', JSON.stringify([...done]));
-    localStorage.setItem('skipped', JSON.stringify([...skipped]));
     render();
   }
 }
