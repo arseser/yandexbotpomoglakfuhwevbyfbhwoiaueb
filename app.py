@@ -168,7 +168,7 @@ async def _send_one(client, item, message_text):
     try:
         entity = await client.get_entity(username)
     except Exception as e:
-        return False, f"entity_error"
+        return False, f"entity_error: {type(e).__name__}"
     if not isinstance(entity, User): return False, "not_a_user"
     if getattr(entity, "bot", False): return False, "is_bot"
 
@@ -180,7 +180,7 @@ async def _send_one(client, item, message_text):
     except errors.UserPrivacyRestrictedError:
         return False, "privacy_restricted"
     except Exception as e:
-        return False, f"send_error"
+        return False, f"send_error: {type(e).__name__}"
 
 def _sender_worker(items, tpl, done_keys):
     loop = asyncio.new_event_loop()
@@ -204,31 +204,35 @@ def _sender_worker(items, tpl, done_keys):
                 with _state_lock: SEND_STATE["current_index"] = idx
                 key = item["id"] or item["name"]
 
-                # Если вы поставили галочку вручную — пропускаем БЕЗ задержки
+                # 1. Пропускаем без задержки, если вы уже поставили галочку
                 if key in done_keys:
-                    with _state_lock: 
+                    with _state_lock:
                         SEND_STATE["skipped"] += 1
-                        SEND_STATE["sent_ids"].add(key) # Чтобы оно зачеркнулось на сайте
-                    _log(f"⏭ {item['name']} — уже отмечено вами")
+                        SEND_STATE["sent_ids"].add(key) # Добавляем, чтобы зачеркнулось на фронте
+                    _log(f"⏭ {item['name']} — уже отмечен вами")
                     continue
 
                 msg = tpl.replace("{name}", item["name"]).replace("{yandex}", item["yandex"] or "")
                 ok, reason = await _send_one(client, item, msg)
                 
-                should_wait = False
+                should_wait = False # Флаг: нужно ли ждать 60 секунд
 
                 with _state_lock:
                     if ok:
                         SEND_STATE["sent"] += 1
                         SEND_STATE["sent_ids"].add(key)
                         _log(f"✅ {item['name']} — отправлено")
-                        should_wait = True # Ждем ТОЛЬКО после успешной отправки
+                        should_wait = True # 2. Ждем ТОЛЬКО если сообщение успешно ушло
                     else:
-                        SEND_STATE["skipped"] += 1 # Если ошибка (бот, канал, макс) — просто зачеркиваем
-                        SEND_STATE["sent_ids"].add(key)
-                        _log(f"⏭ {item['name']} — {reason} (пропуск)")
+                        SEND_STATE["skipped"] += 1
+                        SEND_STATE["sent_ids"].add(key) # Зачеркиваем на фронте
+                        if reason == "no_tg_contact": 
+                            _log(f"⏭ {item['name']} — только MAX (пропущено)")
+                        else: 
+                            _log(f"⏭ {item['name']} — {reason} (пропущено)")
+                        # 3. Если ошибка (бот, канал и т.д.) — should_wait остается False, идем дальше сразу
 
-                # Ждем 60 секунд ТОЛЬКО если сообщение ушло (should_wait = True)
+                # Ждем 60 секунд ТОЛЬКО если should_wait == True
                 if should_wait and idx < len(items) - 1:
                     waited = 0
                     while waited < SEND_DELAY and not _should_stop():
