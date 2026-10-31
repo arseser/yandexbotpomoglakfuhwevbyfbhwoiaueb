@@ -26,6 +26,7 @@ app = Flask(__name__)
 TG_API_ID = os.environ.get("TG_API_ID")
 TG_API_HASH = os.environ.get("TG_API_HASH")
 SEND_DELAY = int(os.environ.get("SEND_DELAY", "60"))
+REPORT_CHAT_ID = int(os.environ.get("REPORT_CHAT_ID", "-5331126029"))  # группа, куда летят отчёты
 
 # ====================== ФИЛЬТРЫ ======================
 NOT_A_SITE = {
@@ -213,6 +214,15 @@ def _sender_worker(items, tpl):
             await client.connect()
             if not await client.is_user_authorized(): _log("Сессия не авторизована."); return
 
+            # группа для отчётов
+            group = None
+            try:
+                await client.get_dialogs()  # прогреваем кэш, иначе Telethon может не найти группу по id
+                group = await client.get_entity(REPORT_CHAT_ID)
+                _log("📣 Группа для отчётов найдена")
+            except Exception as e:
+                _log(f"⚠ Группа {REPORT_CHAT_ID} не найдена ({type(e).__name__}) — рассылка пойдёт без отчётов")
+
             for idx, item in enumerate(items):
                 if _should_stop(): _log("Остановлено."); break
                 _wait_if_paused()
@@ -253,6 +263,15 @@ def _sender_worker(items, tpl):
                     else:
                         SEND_STATE["failed"] += 1
                         _log(f"❌ {item['name']} — {reason}")
+
+                if ok and group:
+                    tg_url = next((c["url"] for c in item["contacts"] if c["type"] == "tg"), "")
+                    uname = tg_url.rstrip("/").split("/")[-1]
+                    report = f"@{uname}\n{item['yandex'] or 'ссылки на Яндекс Карты нет'}"
+                    try:
+                        await client.send_message(group, report)
+                    except Exception as e:
+                        _log(f"⚠ Не отправил отчёт в группу: {type(e).__name__}")
 
                 if not ok: await asyncio.sleep(1)
 
