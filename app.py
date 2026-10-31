@@ -406,12 +406,13 @@ button:disabled{opacity:.5;cursor:not-allowed}
 const DEFAULT_TPL = `Здравствуйте! Я Арсений, заметил, что у «{name}» пока нет сайта — а сейчас многие клиенты перед обращением гуглят или смотрят Яндекс.Карты. Без сайта часть из них просто уходит к конкурентам, у которых он есть.
 Перед визитом или звонком людям важно изучить точные цены, почитать отзывы и убедиться в качестве работы. По статистике, наличие удобной веб-страницы увеличивает количество обращений из карт в среднем на 30–40%.
 Я 4 года создаю сайты под ключ для локального бизнеса. Делаю их быстро, качественно и без лишней головной боли для вас: полностью адаптирую под мобильные телефоны, оформляю понятный прайс, блок с отзывами и контакты.
-Было бы интересно сделать для вас сайт? Могу предоставить вам свою последнюю работу для примера`;
+Было бы интересно сделать для вас сайт? Могу предоставить вам свою последнюю работу для примера
+Если неинтересно, пожалуйста, не блокируйте, просто удалите чат у обоих. Спасибо!`;
 const $ = id => document.getElementById(id);
 let items = [];
 let done = new Set(JSON.parse(localStorage.getItem('done') || '[]'));
 localStorage.removeItem('skipped');
-$('tpl').value = localStorage.getItem('tpl_v2') || DEFAULT_TPL;
+$('tpl').value = localStorage.getItem('tpl_v3') || DEFAULT_TPL;
 
 function msgFor(it) { return $('tpl').value.replaceAll('{name}', it.name); }
 
@@ -460,7 +461,7 @@ $('file').onchange = e => {
 ['dragleave','drop'].forEach(ev => $('drop').addEventListener(ev, e => { e.preventDefault(); $('drop').classList.remove('over'); }));
 $('drop').addEventListener('drop', e => { $('file').files = e.dataTransfer.files; $('file').onchange({target:{files:e.dataTransfer.files}}); });
 
-$('tpl').oninput = () => { localStorage.setItem('tpl_v2', $('tpl').value); render(); };
+$('tpl').oninput = () => { localStorage.setItem('tpl_v3', $('tpl').value); render(); };
 $('hideDone').onchange = render;
 
 function setSendUI(st){
