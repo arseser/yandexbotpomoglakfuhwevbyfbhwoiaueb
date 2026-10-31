@@ -177,6 +177,16 @@ async def _send_one(client, item, message_text):
     if not isinstance(entity, User): return False, f"not_a_user ({type(entity).__name__})"
     if getattr(entity, "bot", False): return False, "is_bot"
 
+    # уже есть переписка с этим человеком (мы писали или он нам) — не пишем
+    try:
+        hist = await client.get_messages(entity, limit=1)
+        if len(hist) > 0: return False, "already_chat"
+    except errors.FloodWaitError as e:
+        return False, f"flood_wait_{e.seconds}s"
+    except Exception as e:
+        # если историю проверить не вышло — на всякий случай НЕ пишем, чтобы не продублировать
+        return False, f"history_error: {type(e).__name__}"
+
     try:
         await client.send_message(entity, message_text)
         return True, "sent"
@@ -227,6 +237,11 @@ def _sender_worker(items, tpl):
                         SEND_STATE["sent"] += 1
                         SEND_STATE["sent_ids"].add(key)
                         _log(f"✅ {item['name']} — отправлено")
+                    elif reason == "already_chat":
+                        # уже есть переписка — не пишем, без кд, помечаем как «Написал(а)»
+                        SEND_STATE["skipped"] += 1
+                        SEND_STATE["sent_ids"].add(key)
+                        _log(f"💬 {item['name']} — уже есть переписка (пропущено)")
                     elif reason == "no_tg_contact":
                         # только MAX — не зачёркиваем, просто идём дальше без кд
                         SEND_STATE["skipped"] += 1
@@ -238,6 +253,8 @@ def _sender_worker(items, tpl):
                     else:
                         SEND_STATE["failed"] += 1
                         _log(f"❌ {item['name']} — {reason}")
+
+                if not ok: await asyncio.sleep(1)
 
                 # 3) Кулдаун ТОЛЬКО если реально отправили сообщение
                 if ok and idx < len(items) - 1:
