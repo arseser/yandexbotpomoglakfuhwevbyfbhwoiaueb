@@ -386,6 +386,7 @@ function render(){
     d.innerHTML = `<h3>${i+1}. ${it.name}</h3>`;
     const links = document.createElement('div'); links.className = 'row'; links.style.margin = '8px 0';
     it.contacts.forEach(c => { const a = document.createElement('a'); a.href = c.url; a.target = '_blank'; a.textContent = (c.type === 'tg' ? 'Telegram' : 'MAX'); links.append(a); });
+    if (it.yandex) { const y = document.createElement('a'); y.href = it.yandex; y.target = '_blank'; y.textContent = 'Яндекс Карты'; links.append(y); }
     d.append(links);
     const m = document.createElement('div'); m.className = 'msg'; m.textContent = msgFor(it); d.append(m);
     const act = document.createElement('div'); act.className = 'row';
